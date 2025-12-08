@@ -1,10 +1,21 @@
 import os
+import logging
 from typing import Any
 from pydantic import BaseModel
-
+from collections.abc import Iterator
 from axon.llms.base_llm import BaseLLM
+from axon.types import LLMMessage
+from axon.tasks.task import Task
+from axon.agents.agent import Agent
+from axon.utilities.agent_utilities import is_context_length_exceeded
+from axon.utilities.exceptions.context_window_exceeding_exception import LLMContextLengthExceededError
 
 from openai import APIConnectionError, NotFoundError, OpenAI
+
+from openai.types.chat import ChatCompletion, ChatCompletionChunk
+from openai.types.chat.chat_completion import Choice
+from openai.types.chat.chat_completion_chunk import ChoiceDelta
+
 
 class OpenAICompletion(BaseLLM):
     """OpenAI completion implementation.
@@ -85,4 +96,163 @@ class OpenAICompletion(BaseLLM):
         if self.client_params:
             client_params.update(self.client_params)
 
-        return client_params    
+        return client_params   
+
+    def _format_messages(self, messages: str | list[LLMMessage]) -> list[LLMMessage]:        
+        return super()._format_messages(messages)
+        
+    def _prepare_completion_params(
+        self, messages: list[LLMMessage]
+    ) -> dict[str, Any]:    
+        """Prepare parameters for OpenAI chat completion."""
+        params.update(self.additional_params)
+
+        params: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+        }
+        if self.stream:
+            params["stream"] = self.stream
+
+        if self.temperature is not None:
+            params["temperature"] = self.temperature
+        
+
+        # Filter out CrewAI-specific parameters that shouldn't go to the API
+        crewai_specific_params = {
+            "callbacks",
+            "available_functions",
+            "from_task",
+            "from_agent",
+            "provider",
+            "api_key",
+            "base_url",
+            "api_base",
+            "timeout",
+        }
+
+        return {k: v for k, v in params.items() if k not in crewai_specific_params}
+
+    def _handle_streaming_completion(
+        self,
+        params: dict[str, Any],
+        from_task: Any | None = None,
+        from_agent: Any | None = None,
+        response_model: type[BaseModel] | None = None,
+    ) -> str:
+        """Handle streaming chat completion."""
+        full_response = ""
+                
+        completion_stream: Iterator[ChatCompletionChunk] = self.client.chat.completions.create(
+            **params
+        )
+
+        accumulated_content = ""
+        for chunk in completion_stream:
+            if not chunk.choices:
+                continue
+
+            choice = chunk.choices[0]
+            delta: ChoiceDelta = choice.delta
+
+            if delta.content:
+                accumulated_content += delta.content
+
+        if response_model:                
+            try:
+                parsed_object = response_model.model_validate_json(accumulated_content)
+                structured_json = parsed_object.model_dump_json()          
+                return structured_json
+            except Exception as e:
+                logging.error(f"Failed to parse structured output from stream: {e}")                
+                return accumulated_content
+
+        accumulated_content = self._apply_stop_words(accumulated_content)        
+        return accumulated_content
+
+    def _handle_completion(
+        self,
+        params: dict[str, Any],
+        from_task: Any | None = None,
+        from_agent: Any | None = None,
+        response_model: type[BaseModel] | None = None,
+    ) -> str | Any:
+        """Handle non-streaming chat completion."""
+        try:
+            if response_model:
+                parsed_response = self.client.beta.chat.completions.parse(
+                    **params,
+                    response_format=response_model,
+                )
+                math_reasoning = parsed_response.choices[0].message
+
+                if math_reasoning.refusal:
+                    pass
+
+                parsed_object = parsed_response.choices[0].message.parsed
+                if parsed_object:
+                    structured_json = parsed_object.model_dump_json()
+                    return structured_json
+
+            response: ChatCompletion = self.client.chat.completions.create(**params)
+            choice: Choice = response.choices[0]
+            message = choice.message
+
+            content = message.content or ""
+            content = self._apply_stop_words(content)
+
+            if self.response_format and isinstance(self.response_format, type):
+                try:
+                    structured_result = self._validate_structured_output(
+                        content, self.response_format
+                    )
+                    return structured_result
+                except ValueError as e:
+                    logging.warning(f"Structured output validation failed: {e}")
+
+        except NotFoundError as e:
+            error_msg = f"Model {self.model} not found: {e}"
+            logging.error(error_msg)
+            self._emit_call_failed_event(
+                error=error_msg, from_task=from_task, from_agent=from_agent
+            )
+            raise ValueError(error_msg) from e
+        except APIConnectionError as e:
+            error_msg = f"Failed to connect to OpenAI API: {e}"
+            logging.error(error_msg)
+            self._emit_call_failed_event(
+                error=error_msg, from_task=from_task, from_agent=from_agent
+            )
+            raise ConnectionError(error_msg) from e
+        except Exception as e:
+            # Handle context length exceeded and other errors
+            if is_context_length_exceeded(e):
+                logging.error(f"Context window exceeded: {e}")
+                raise LLMContextLengthExceededError(str(e)) from e
+
+            error_msg = f"OpenAI API call failed: {e!s}"
+            logging.error(error_msg)
+            self._emit_call_failed_event(
+                error=error_msg, from_task=from_task, from_agent=from_agent
+            )
+            raise e from e
+
+        return content
+
+    def call(
+        self,
+        messages: str | list[LLMMessage],
+        from_task: Task | None = None,
+        from_agent: Agent | None = None,
+        response_model: type[BaseModel] | None = None,
+    ) -> str | Any:
+        """Call OpenAI chat completion api.
+        Args:
+            messages: Input message of the api call.
+            from_task: Task that initiated the call.
+            from_agent: Agent that initiated the call.
+            response_model: Response model of the structured output.
+        
+        Returns:
+            chat completion response.            
+        """
