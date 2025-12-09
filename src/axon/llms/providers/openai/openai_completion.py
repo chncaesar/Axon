@@ -184,10 +184,11 @@ class OpenAICompletion(BaseLLM):
                     **params,
                     response_format=response_model,
                 )
-                math_reasoning = parsed_response.choices[0].message
+                choice = parsed_response.choices[0].message
 
-                if math_reasoning.refusal:
-                    pass
+                if choice.refusal:
+                    logging.warning(f"Model refusal: {choice.refusal}")
+                    
 
                 parsed_object = parsed_response.choices[0].message.parsed
                 if parsed_object:
@@ -256,3 +257,32 @@ class OpenAICompletion(BaseLLM):
         Returns:
             chat completion response.            
         """
+        try:
+            formatted_messages = self._format_messages(messages)
+
+            completion_params = self._prepare_completion_params(
+                messages=formatted_messages
+            )
+
+            if self.stream:
+                return self._handle_streaming_completion(
+                    params=completion_params,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                    response_model=response_model,
+                )
+
+            return self._handle_completion(
+                params=completion_params,
+                from_task=from_task,
+                from_agent=from_agent,
+                response_model=response_model,
+            )
+
+        except Exception as e:
+            error_msg = f"OpenAI API call failed: {e!s}"
+            logging.error(error_msg)
+            self._emit_call_failed_event(
+                error=error_msg, from_task=from_task, from_agent=from_agent
+            )
+            raise

@@ -3,6 +3,7 @@ from pydantic import Field, model_validator
 from axon.agents.base_agent import BaseAgent
 from axon.tools.base_tool import BaseTool
 from axon.tasks.task import Task
+from axon.utilities.llm_utilities import create_llm
 
 class Agent(BaseAgent):
 
@@ -12,30 +13,282 @@ class Agent(BaseAgent):
     )
 
     @model_validator(mode="after")
-    def init():
+    def init(self):
         """ Initializes the Agent.        
         """
         self.llm = create_llm(self.llm)
+        return self
 
 
     def execute_task(
         self,
         task: Task,
-        context: str | None = None,        
-        tools: list[BaseTool] | None = None
+        context: str | None = None
     ) -> Any:
-        """Execute a task.
+        """Execute a task with the agent.
 
-        Args: 
-            task: The task to execute
-            context: Task's context
-            tools: tools used by the task
+        Args:
+            task: Task to execute.
+            context: Context to execute the task in.
 
         Returns:
-            Tasks's execution output
+            Output of the agent
 
-        Raises
-            TimeoutError: If the execution exceeds the max execution time.
-            ValueError: If tasks's max execution time is not positive.
-            RuntimeError: Other errors.
+        Raises:
+            TimeoutError: If execution exceeds the maximum execution time.
+            ValueError: If the max execution time is not a positive integer.
+            RuntimeError: If the agent execution fails for other reasons.
         """
+        if self.reasoning:
+            try:
+                from axon.utilities.reasoning_handler import (
+                    AgentReasoning,
+                    AgentReasoningOutput,
+                )
+
+                reasoning_handler = AgentReasoning(task=task, agent=self)
+                reasoning_output: AgentReasoningOutput = (
+                    reasoning_handler.handle_agent_reasoning()
+                )
+
+                # Add the reasoning plan to the task description
+                task.description += f"\n\nReasoning Plan:\n{reasoning_output.plan.plan}"
+            except Exception as e:
+                self._logger.log("error", f"Error during reasoning process: {e!s}")
+        self._inject_date_to_task(task)
+
+        if self.tools_handler:
+            self.tools_handler.last_used_tool = None
+
+        task_prompt = task.prompt()
+
+        # If the task requires output in JSON or Pydantic format,
+        # append specific instructions to the task prompt to ensure
+        # that the final answer does not include any code block markers
+        # Skip this if task.response_model is set, as native structured outputs handle schema automatically
+        if (task.output_json or task.output_pydantic) and not task.response_model:
+            # Generate the schema based on the output format
+            if task.output_json:
+                schema_dict = generate_model_description(task.output_json)
+                schema = json.dumps(schema_dict["json_schema"]["schema"], indent=2)
+                task_prompt += "\n" + self.i18n.slice(
+                    "formatted_task_instructions"
+                ).format(output_format=schema)
+
+            elif task.output_pydantic:
+                schema_dict = generate_model_description(task.output_pydantic)
+                schema = json.dumps(schema_dict["json_schema"]["schema"], indent=2)
+                task_prompt += "\n" + self.i18n.slice(
+                    "formatted_task_instructions"
+                ).format(output_format=schema)
+
+        if context:
+            task_prompt = self.i18n.slice("task_with_context").format(
+                task=task_prompt, context=context
+            )
+
+        if self._is_any_available_memory():
+            crewai_event_bus.emit(
+                self,
+                event=MemoryRetrievalStartedEvent(
+                    task_id=str(task.id) if task else None,
+                    source_type="agent",
+                    from_agent=self,
+                    from_task=task,
+                ),
+            )
+
+            start_time = time.time()
+
+            contextual_memory = ContextualMemory(
+                self.crew._short_term_memory,
+                self.crew._long_term_memory,
+                self.crew._entity_memory,
+                self.crew._external_memory,
+                agent=self,
+                task=task,
+            )
+            memory = contextual_memory.build_context_for_task(task, context or "")
+            if memory.strip() != "":
+                task_prompt += self.i18n.slice("memory").format(memory=memory)
+
+            crewai_event_bus.emit(
+                self,
+                event=MemoryRetrievalCompletedEvent(
+                    task_id=str(task.id) if task else None,
+                    memory_content=memory,
+                    retrieval_time_ms=(time.time() - start_time) * 1000,
+                    source_type="agent",
+                    from_agent=self,
+                    from_task=task,
+                ),
+            )
+        knowledge_config = (
+            self.knowledge_config.model_dump() if self.knowledge_config else {}
+        )
+
+        if self.knowledge or (self.crew and self.crew.knowledge):
+            crewai_event_bus.emit(
+                self,
+                event=KnowledgeRetrievalStartedEvent(
+                    from_task=task,
+                    from_agent=self,
+                ),
+            )
+            try:
+                self.knowledge_search_query = self._get_knowledge_search_query(
+                    task_prompt, task
+                )
+                if self.knowledge_search_query:
+                    # Quering agent specific knowledge
+                    if self.knowledge:
+                        agent_knowledge_snippets = self.knowledge.query(
+                            [self.knowledge_search_query], **knowledge_config
+                        )
+                        if agent_knowledge_snippets:
+                            self.agent_knowledge_context = extract_knowledge_context(
+                                agent_knowledge_snippets
+                            )
+                            if self.agent_knowledge_context:
+                                task_prompt += self.agent_knowledge_context
+
+                    # Quering crew specific knowledge
+                    knowledge_snippets = self.crew.query_knowledge(
+                        [self.knowledge_search_query], **knowledge_config
+                    )
+                    if knowledge_snippets:
+                        self.crew_knowledge_context = extract_knowledge_context(
+                            knowledge_snippets
+                        )
+                        if self.crew_knowledge_context:
+                            task_prompt += self.crew_knowledge_context
+
+                    crewai_event_bus.emit(
+                        self,
+                        event=KnowledgeRetrievalCompletedEvent(
+                            query=self.knowledge_search_query,
+                            from_task=task,
+                            from_agent=self,
+                            retrieved_knowledge=(
+                                (self.agent_knowledge_context or "")
+                                + (
+                                    "\n"
+                                    if self.agent_knowledge_context
+                                    and self.crew_knowledge_context
+                                    else ""
+                                )
+                                + (self.crew_knowledge_context or "")
+                            ),
+                        ),
+                    )
+            except Exception as e:
+                crewai_event_bus.emit(
+                    self,
+                    event=KnowledgeSearchQueryFailedEvent(
+                        query=self.knowledge_search_query or "",
+                        error=str(e),
+                        from_task=task,
+                        from_agent=self,
+                    ),
+                )
+
+        tools = tools or self.tools or []
+        self.create_agent_executor(tools=tools, task=task)
+
+        if self.crew and self.crew._train:
+            task_prompt = self._training_handler(task_prompt=task_prompt)
+        else:
+            task_prompt = self._use_trained_data(task_prompt=task_prompt)
+
+        # Import agent events locally to avoid circular imports
+        from crewai.events.types.agent_events import (
+            AgentExecutionCompletedEvent,
+            AgentExecutionErrorEvent,
+            AgentExecutionStartedEvent,
+        )
+
+        try:
+            crewai_event_bus.emit(
+                self,
+                event=AgentExecutionStartedEvent(
+                    agent=self,
+                    tools=self.tools,
+                    task_prompt=task_prompt,
+                    task=task,
+                ),
+            )
+
+            # Determine execution method based on timeout setting
+            if self.max_execution_time is not None:
+                if (
+                    not isinstance(self.max_execution_time, int)
+                    or self.max_execution_time <= 0
+                ):
+                    raise ValueError(
+                        "Max Execution time must be a positive integer greater than zero"
+                    )
+                result = self._execute_with_timeout(
+                    task_prompt, task, self.max_execution_time
+                )
+            else:
+                result = self._execute_without_timeout(task_prompt, task)
+
+        except TimeoutError as e:
+            # Propagate TimeoutError without retry
+            crewai_event_bus.emit(
+                self,
+                event=AgentExecutionErrorEvent(
+                    agent=self,
+                    task=task,
+                    error=str(e),
+                ),
+            )
+            raise e
+        except Exception as e:
+            if e.__class__.__module__.startswith("litellm"):
+                # Do not retry on litellm errors
+                crewai_event_bus.emit(
+                    self,
+                    event=AgentExecutionErrorEvent(
+                        agent=self,
+                        task=task,
+                        error=str(e),
+                    ),
+                )
+                raise e
+            self._times_executed += 1
+            if self._times_executed > self.max_retry_limit:
+                crewai_event_bus.emit(
+                    self,
+                    event=AgentExecutionErrorEvent(
+                        agent=self,
+                        task=task,
+                        error=str(e),
+                    ),
+                )
+                raise e
+            result = self.execute_task(task, context, tools)
+
+        if self.max_rpm and self._rpm_controller:
+            self._rpm_controller.stop_rpm_counter()
+
+        # If there was any tool in self.tools_results that had result_as_answer
+        # set to True, return the results of the last tool that had
+        # result_as_answer set to True
+        for tool_result in self.tools_results:
+            if tool_result.get("result_as_answer", False):
+                result = tool_result["result"]
+        crewai_event_bus.emit(
+            self,
+            event=AgentExecutionCompletedEvent(agent=self, task=task, output=result),
+        )
+
+        self._last_messages = (
+            self.agent_executor.messages.copy()
+            if self.agent_executor and hasattr(self.agent_executor, "messages")
+            else []
+        )
+
+        self._cleanup_mcp_clients()
+
+        return result
