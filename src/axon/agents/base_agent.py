@@ -11,7 +11,7 @@ from axon.tools.base_tool import BaseTool
 from axon.llms.llm import LLM
 from axon.tasks.task import Task
 from axon.prompt.prompt import Prompt, get_prompt
-
+from axon.utilities.string_utils import interpolate_only
 
 class BaseAgent(BaseModel, ABC):
     uuid: UUID4 = Field(default_factory=uuid.uuid4, frozen=True)
@@ -29,6 +29,26 @@ class BaseAgent(BaseModel, ABC):
     )
 
     
+    def interpolate_inputs(self, inputs: dict[str, Any]) -> None:
+        """Interpolate inputs into the agent description and backstory."""
+        if self._original_role is None:
+            self._original_role = self.role
+        if self._original_goal is None:
+            self._original_goal = self.goal
+        if self._original_backstory is None:
+            self._original_backstory = self.backstory
+
+        if inputs:
+            self.role = interpolate_only(
+                input_string=self._original_role, inputs=inputs
+            )
+            self.goal = interpolate_only(
+                input_string=self._original_goal, inputs=inputs
+            )
+            self.backstory = interpolate_only(
+                input_string=self._original_backstory, inputs=inputs
+            )
+
 
     @abstractmethod
     def execute_task(

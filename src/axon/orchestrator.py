@@ -112,3 +112,14 @@ class Orchestrator(BaseModel):
             raise
         finally:
             detach(token)
+
+    def _interpolate_inputs(self, inputs: dict[str, Any]) -> None:
+        """Interpolates the inputs in the tasks and agents."""
+        [
+            task.interpolate_inputs_and_add_conversation_history(
+                inputs
+            )
+            for task in self.tasks
+        ]
+        for agent in self.agents:
+            agent.interpolate_inputs(inputs)            
