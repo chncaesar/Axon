@@ -6,10 +6,25 @@ from axon.tasks.task import Task
 from axon.orchestrator import Orchestrator
 from axon.agents.agent import Agent
 from axon.utilities.prompts import StandardPromptResult, SystemPromptResult
-from axon.utilities.agent_utilities import format_message_for_llm, handle_unknown_error
+from axon.utilities.agent_utilities import (
+    format_message_for_llm, 
+    handle_unknown_error, 
+    has_reached_max_iterations,
+    handle_max_iterations_exceeded,
+    get_llm_response,
+    process_llm_response,
+    handle_output_parser_exception,
+    is_context_length_exceeded,
+    handle_context_length,
+)
+from axon.utilities.printer import Printer
 from axon.prompt.prompt import Prompt, get_prompt
 from axon.types import LLMMessage
-from axon.agents.parser import AgentFinish
+from axon.agents.parser import (
+    AgentFinish, 
+    AgentAction,
+    OutputParserError
+)
 
 class AgentExecutor():
     """Executor for agents.
@@ -52,6 +67,7 @@ class AgentExecutor():
         self.messages: list[LLMMessage] = []
         self.iterations = 0
         self.log_error_after = 3
+        self._printer: Printer = Printer()
 
         if self.llm:
             existing_stop = getattr(self.llm, "stop", [])
@@ -62,6 +78,14 @@ class AgentExecutor():
                     else self.stop
                 )
             )
+    
+    @property
+    def use_stop_words(self) -> bool:
+        """Check to see if stop words are being used.
+        Returns:
+            bool: True if stop words are being used.
+        """
+        return self.llm.supports_stop_words if self.llm else False
 
     def invoke(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Execute the agent with given inputs.
@@ -109,6 +133,57 @@ class AgentExecutor():
         Returns:
             Final answer from the agent.
         """    
+        formatted_answer = None
+        while not isinstance(formatted_answer, AgentFinish):
+            try:
+                if has_reached_max_iterations(self.iterations, self.max_iter):
+                    formatted_answer = handle_max_iterations_exceeded(
+                        formatted_answer,
+                        printer=self._printer,
+                        i18n=self._i18n,
+                        messages=self.messages,
+                        llm=self.llm,
+                    )
+                    break
+
+                answer = get_llm_response(
+                    llm=self.llm,
+                    messages=self.messages,
+                    printer=self._printer,
+                    from_task=self.task,
+                    from_agent=self.agent,
+                    response_model=self.response_model,
+                    executor_context=self,
+                )
+                formatted_answer = process_llm_response(answer, self.use_stop_words)
+
+                self._append_message(formatted_answer.text)
+
+            except OutputParserError as e:
+                formatted_answer = handle_output_parser_exception(
+                    e = e,
+                    messages = self.messages,
+                    iterations = self.iterations,
+                    log_error_after = self.log_error_after,
+                    printer = self._printer
+                )
+            except Exception as e:
+                if is_context_length_exceeded(e):
+                    handle_context_length(
+                        respect_context_window=self.respect_context_window,
+                        printer=self._printer,
+                        messages=self.messages,
+                        llm=self.llm,
+                        callbacks=self.callbacks,
+                        i18n=self._i18n,
+                    )
+                    continue
+                handle_unknown_error(self._printer, e)
+                raise e
+            finally:
+                self.iterations += 1    
+
+    
 
     @staticmethod
     def _format_promt(prompt: str, inputs: dict[str, Any]) -> str:

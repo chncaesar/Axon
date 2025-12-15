@@ -7,6 +7,7 @@ from axon.tools.base_tool import BaseTool
 from axon.tasks.task import Task
 from axon.utilities.llm_utilities import create_llm
 from axon.utilities.prompts import Prompts
+from axon.agents.agent_executor import AgentExecutor
 
 class Agent(BaseAgent):
     orchestrator: Any = Field(default=None, description="The orchestrator to which the agent belongs.")
